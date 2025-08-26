@@ -1,0 +1,102 @@
+name: Unity Build → Network Share (Windows + Platform-Aware Archive)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: [self-hosted, linux]   # your WSL runner
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      # Sync to LOCAL NTFS so Unity's Library is not on SMB (prevents LMDB crash)
+      - name: Sync project to C:\UnityCI\Projects\<project>
+        run: |
+          set -e
+          PROJECT_NAME=$(basename "$GITHUB_REPOSITORY")
+          LOCAL_PROJECT="/mnt/c/UnityCI/Projects/${PROJECT_NAME}"
+          mkdir -p "$LOCAL_PROJECT"
+          rsync -a --delete --exclude='.git' "$GITHUB_WORKSPACE/" "$LOCAL_PROJECT/"
+          echo "✅ Project synced to $LOCAL_PROJECT"
+
+      # Build with Unity.exe (Windows paths only). BuildScript decides platform & output.
+      - name: Build using project's current platform
+        run: |
+          set -e
+          UNITY_PATH="/mnt/c/Program Files/Unity/Hub/Editor/6000.2.0f1/Editor/Unity.exe"
+          PROJECT_NAME=$(basename "$GITHUB_REPOSITORY")
+          LOCAL_PROJECT="/mnt/c/UnityCI/Projects/${PROJECT_NAME}"
+
+          WIN_PROJECT=$(wslpath -w "$LOCAL_PROJECT")
+          WIN_LOG=$(wslpath -w "$LOCAL_PROJECT/build_current_platform.log")
+
+          # Ensure base build-folder exists (script writes inside it)
+          mkdir -p "$LOCAL_PROJECT/build-folder"
+
+          "$UNITY_PATH" -quit -batchmode -nographics \
+            -projectPath "$WIN_PROJECT" \
+            -executeMethod BuildScript.PerformCurrentPlatformBuild \
+            -logFile "$WIN_LOG" || {
+              echo "❌ Build failed. Last 200 lines of log:"
+              tail -n 200 "$LOCAL_PROJECT/build_current_platform.log" || true
+              exit 1
+            }
+
+          echo "✅ Build complete"
+          tail -n 80 "$LOCAL_PROJECT/build_current_platform.log" || true
+
+      # Platform-aware archive:
+      # copies build-folder/<Platform>/output/* → /mnt/teamxr/Unity Builds/<project>/<Platform>/<timestamp>/
+      # also refreshes /mnt/teamxr/Unity Builds/<project>/<Platform>/latest/
+      - name: Archive builds per platform (timestamped + latest)
+        run: |
+          set -e
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          PROJECT_NAME=$(basename "$GITHUB_REPOSITORY")
+
+          BUILD_ROOT="/mnt/c/UnityCI/Projects/${PROJECT_NAME}/build-folder"
+          BASE_DEST="/mnt/teamxr/Unity Builds/${PROJECT_NAME}"
+
+          if [ ! -d "$BUILD_ROOT" ]; then
+            echo "❌ No build-folder found at $BUILD_ROOT"
+            exit 1
+          fi
+
+          found_any=0
+          for PLATFORM_DIR in "$BUILD_ROOT"/*; do
+            [ -d "$PLATFORM_DIR" ] || continue
+            PLATFORM=$(basename "$PLATFORM_DIR")
+            SRC_DIR="$PLATFORM_DIR/output"
+
+            if [ ! -d "$SRC_DIR" ]; then
+              echo "ℹ️  Skipping ${PLATFORM}: no output at ${SRC_DIR}"
+              continue
+            fi
+
+            found_any=1
+            DEST_TIME="${BASE_DEST}/${PLATFORM}/${TIMESTAMP}"
+            DEST_LATEST="${BASE_DEST}/${PLATFORM}/latest"
+
+            echo "📦 Archiving ${PLATFORM} →"
+            echo "   - ${DEST_TIME}"
+            echo "   - ${DEST_LATEST}"
+
+            mkdir -p "$DEST_TIME" "$DEST_LATEST"
+
+            # copy everything (files + subfolders), preserve attrs
+            rsync -a "$SRC_DIR"/ "$DEST_TIME"/
+
+            # refresh 'latest'
+            rm -rf "$DEST_LATEST"
+            mkdir -p "$DEST_LATEST"
+            rsync -a "$SRC_DIR"/ "$DEST_LATEST"/
+
+            echo "✅ ${PLATFORM}: archived + latest updated"
+          done
+
+          if [ "$found_any" -eq 0 ]; then
+            echo "❌ No platform outputs found under ${BUILD_ROOT}/*/output"
+            exit 1
+          fi
